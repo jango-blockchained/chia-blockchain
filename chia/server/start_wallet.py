@@ -1,16 +1,26 @@
-import pathlib
-from multiprocessing import freeze_support
-from typing import Dict, Optional
+from __future__ import annotations
 
-from chia.consensus.constants import ConsensusConstants
+import os
+import pathlib
+import sys
+from multiprocessing import freeze_support
+from typing import Any, Optional
+
+from chia_rs import ConsensusConstants
+
+from chia.apis import ApiProtocolRegistry
+from chia.consensus.constants import replace_str_to_bytes
 from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.rpc.wallet_rpc_api import WalletRpcApi
 from chia.server.outbound_message import NodeType
-from chia.server.start_service import run_service
-from chia.types.peer_info import PeerInfo
-from chia.util.config import load_config_cli, load_config
-from chia.util.default_root import DEFAULT_ROOT_PATH
+from chia.server.signal_handlers import SignalHandlers
+from chia.server.start_service import RpcInfo, Service, async_run
+from chia.types.aliases import WalletService
+from chia.util.chia_logging import initialize_service_logging
+from chia.util.config import get_unresolved_peer_infos, load_config, load_config_cli
+from chia.util.default_root import resolve_root_path
 from chia.util.keychain import Keychain
+from chia.util.task_timing import maybe_manage_task_instrumentation
 from chia.wallet.wallet_node import WalletNode
 
 # See: https://bugs.python.org/issue29288
@@ -21,79 +31,85 @@ from chia.wallet.wallet_node_api import WalletNodeAPI
 SERVICE_NAME = "wallet"
 
 
-def service_kwargs_for_wallet(
+def create_wallet_service(
     root_path: pathlib.Path,
-    config: Dict,
+    config: dict[str, Any],
     consensus_constants: ConsensusConstants,
     keychain: Optional[Keychain] = None,
-) -> Dict:
-    overrides = config["network_overrides"]["constants"][config["selected_network"]]
-    updated_constants = consensus_constants.replace_str_to_bytes(**overrides)
-    # add local node to trusted peers if old config
-    if "trusted_peers" not in config:
-        full_node_config = load_config(DEFAULT_ROOT_PATH, "config.yaml", "full_node")
-        trusted_peer = full_node_config["ssl"]["public_crt"]
-        config["trusted_peers"] = {}
-        config["trusted_peers"]["local_node"] = trusted_peer
-    if "short_sync_blocks_behind_threshold" not in config:
-        config["short_sync_blocks_behind_threshold"] = 20
+    connect_to_daemon: bool = True,
+) -> WalletService:
+    service_config = config[SERVICE_NAME]
+
+    network_id = service_config["selected_network"]
+    overrides = service_config["network_overrides"]["constants"][network_id]
+    updated_constants = replace_str_to_bytes(consensus_constants, **overrides)
+    service_config.setdefault("short_sync_blocks_behind_threshold", 20)
+
     node = WalletNode(
-        config,
+        service_config,
         root_path,
-        consensus_constants=updated_constants,
+        constants=updated_constants,
         local_keychain=keychain,
     )
     peer_api = WalletNodeAPI(node)
-    fnp = config.get("full_node_peer")
 
-    if fnp:
-        connect_peers = [PeerInfo(fnp["host"], fnp["port"])]
-        node.full_node_peer = PeerInfo(fnp["host"], fnp["port"])
-    else:
-        connect_peers = []
-        node.full_node_peer = None
-    network_id = config["selected_network"]
-    kwargs = dict(
+    rpc_info: Optional[RpcInfo[WalletRpcApi]] = None
+    if service_config.get("start_rpc_server", True):
+        rpc_info = (WalletRpcApi, service_config["rpc_port"])
+
+    return Service(
         root_path=root_path,
+        config=config,
         node=node,
         peer_api=peer_api,
         node_type=NodeType.WALLET,
+        advertised_port=None,
         service_name=SERVICE_NAME,
+        connect_peers=get_unresolved_peer_infos(service_config, NodeType.FULL_NODE),
         on_connect_callback=node.on_connect,
-        connect_peers=connect_peers,
-        auth_connect_peers=False,
         network_id=network_id,
+        rpc_info=rpc_info,
+        connect_to_daemon=connect_to_daemon,
+        class_for_type=ApiProtocolRegistry,
     )
-    port = config.get("port")
-    if port is not None:
-        kwargs.update(
-            advertised_port=config["port"],
-            server_listen_ports=[config["port"]],
-        )
-    rpc_port = config.get("rpc_port")
-    if rpc_port is not None:
-        kwargs["rpc_info"] = (WalletRpcApi, config["rpc_port"])
-
-    return kwargs
 
 
-def main() -> None:
-    config = load_config_cli(DEFAULT_ROOT_PATH, "config.yaml", SERVICE_NAME)
+async def async_main(root_path: pathlib.Path) -> int:
+    # TODO: refactor to avoid the double load
+    config = load_config(root_path, "config.yaml")
+    service_config = load_config_cli(root_path, "config.yaml", SERVICE_NAME)
+    config[SERVICE_NAME] = service_config
+
     # This is simulator
-    local_test = config["testing"]
+    local_test = service_config.get("testing", False)
     if local_test is True:
-        from tests.block_tools import test_constants
+        from chia.simulator.block_tools import test_constants
 
         constants = test_constants
-        current = config["database_path"]
-        config["database_path"] = f"{current}_simulation"
-        config["selected_network"] = "testnet0"
+        current = service_config["database_path"]
+        service_config["database_path"] = f"{current}_simulation"
+        service_config["selected_network"] = "testnet0"
     else:
         constants = DEFAULT_CONSTANTS
-    kwargs = service_kwargs_for_wallet(DEFAULT_ROOT_PATH, config, constants)
-    return run_service(**kwargs)
+    initialize_service_logging(service_name=SERVICE_NAME, config=config, root_path=root_path)
+
+    service = create_wallet_service(root_path, config, constants)
+    async with SignalHandlers.manage() as signal_handlers:
+        await service.setup_process_global_state(signal_handlers=signal_handlers)
+        await service.run()
+
+    return 0
+
+
+def main() -> int:
+    freeze_support()
+    root_path = resolve_root_path(override=None)
+
+    with maybe_manage_task_instrumentation(
+        enable=os.environ.get(f"CHIA_INSTRUMENT_{SERVICE_NAME.upper()}") is not None
+    ):
+        return async_run(coro=async_main(root_path=root_path))
 
 
 if __name__ == "__main__":
-    freeze_support()
-    main()
+    sys.exit(main())

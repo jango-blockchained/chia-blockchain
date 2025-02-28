@@ -12,12 +12,14 @@ you can use p2_conditions.
 This roughly corresponds to bitcoin's graftroot.
 """
 
+from __future__ import annotations
+
+from chia_puzzles_py.programs import P2_DELEGATED_PUZZLE
+
 from chia.types.blockchain_format.program import Program
+from chia.wallet.puzzles import p2_conditions
 
-from . import p2_conditions
-from .load_clvm import load_clvm
-
-MOD = load_clvm("p2_delegated_puzzle.clvm")
+MOD = Program.from_bytes(P2_DELEGATED_PUZZLE)
 
 
 def puzzle_for_pk(public_key: bytes) -> Program:
