@@ -1,20 +1,18 @@
-import click
-import colorama
+from __future__ import annotations
+
 import os
 import sys
-
-from chia.daemon.client import acquire_connection_to_daemon
-from chia.util.keychain import Keychain, obtain_current_passphrase, supports_os_passphrase_storage
-from chia.util.keyring_wrapper import DEFAULT_PASSPHRASE_IF_NO_MASTER_PASSPHRASE
-from chia.util.misc import prompt_yes_no
-from chia.util.ws_message import WsRpcMessage
 from getpass import getpass
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional
 
-# Click drops leading dashes, and converts remaining dashes to underscores. e.g. --set-passphrase -> 'set_passphrase'
-PASSPHRASE_CLI_OPTION_NAMES = ["keys_root_path", "set_passphrase", "passphrase_file", "current_passphrase_file"]
+import click
+import colorama
+
+from chia.daemon.client import acquire_connection_to_daemon
+from chia.util.keychain import Keychain, supports_os_passphrase_storage
+from chia.util.keyring_wrapper import DEFAULT_PASSPHRASE_IF_NO_MASTER_PASSPHRASE, obtain_current_passphrase
 
 SAVE_MASTER_PASSPHRASE_WARNING = (
     colorama.Fore.YELLOW
@@ -26,20 +24,9 @@ SAVE_MASTER_PASSPHRASE_WARNING = (
 )
 
 
-def remove_passphrase_options_from_cmd(cmd) -> None:
-    """
-    Filters-out passphrase options from a given Click command object
-    """
-    # TODO: Click doesn't seem to have a great way of adding/removing params using an
-    # existing command, and using the decorator-supported construction of options doesn't
-    # allow for conditionally including options. Once keyring passphrase management is
-    # rolled out to all platforms this can be removed.
-    cmd.params = [param for param in cmd.params if param.name not in PASSPHRASE_CLI_OPTION_NAMES]
-
-
 def verify_passphrase_meets_requirements(
     new_passphrase: str, confirmation_passphrase: str
-) -> Tuple[bool, Optional[str]]:
+) -> tuple[bool, Optional[str]]:
     match = new_passphrase == confirmation_passphrase
     min_length = Keychain.minimum_passphrase_length()
     meets_len_requirement = len(new_passphrase) >= min_length
@@ -52,13 +39,6 @@ def verify_passphrase_meets_requirements(
         return False, f"Minimum passphrase length is {min_length}"
     else:
         raise Exception("Unexpected passphrase verification case")
-
-
-def prompt_for_passphrase(prompt: str) -> str:
-    if sys.platform == "win32" or sys.platform == "cygwin":
-        print(prompt, end="")
-        prompt = ""
-    return getpass(prompt)
 
 
 def prompt_to_save_passphrase() -> bool:
@@ -88,7 +68,7 @@ def prompt_to_save_passphrase() -> bool:
                 colorama.init()
 
                 print(warning)
-            save = prompt_yes_no(f"Would you like to save your passphrase to the {location} (y/n) ")
+            save = click.confirm(f"Would you like to save your passphrase to the {location}?", default=None)
 
     except Exception as e:
         print(f"Caught exception: {e}")
@@ -97,7 +77,7 @@ def prompt_to_save_passphrase() -> bool:
     return save
 
 
-def prompt_for_new_passphrase() -> Tuple[str, bool]:
+def prompt_for_new_passphrase() -> tuple[str, bool]:
     min_length: int = Keychain.minimum_passphrase_length()
     if min_length > 0:
         n = min_length
@@ -236,7 +216,7 @@ def get_current_passphrase() -> Optional[str]:
             current_passphrase = obtain_current_passphrase()
         except Exception as e:
             print(f"Unable to confirm current passphrase: {e}")
-            raise e
+            raise
 
     return current_passphrase
 
@@ -290,7 +270,7 @@ def remove_passphrase_hint() -> None:
         print("Passphrase hint was not removed")
 
 
-async def async_update_daemon_passphrase_cache_if_running(root_path: Path) -> None:
+async def async_update_daemon_passphrase_cache_if_running(root_path: Path, config: dict[str, Any]) -> None:
     """
     Attempt to connect to the daemon and update the cached passphrase
     """
@@ -298,7 +278,7 @@ async def async_update_daemon_passphrase_cache_if_running(root_path: Path) -> No
     assert new_passphrase is not None
 
     try:
-        async with acquire_connection_to_daemon(root_path, quiet=True) as daemon:
+        async with acquire_connection_to_daemon(root_path, config, quiet=True) as daemon:
             if daemon is not None:
                 response = await daemon.unlock_keyring(new_passphrase)
                 if response is None:
@@ -310,26 +290,3 @@ async def async_update_daemon_passphrase_cache_if_running(root_path: Path) -> No
                     raise Exception(error)
     except Exception as e:
         print(f"Failed to notify daemon of updated keyring passphrase: {e}")
-
-
-async def async_update_daemon_migration_completed_if_running() -> None:
-    """
-    Attempt to connect to the daemon to notify that keyring migration has completed.
-    This allows the daemon to refresh its keyring so that it can stop using the
-    legacy keyring.
-    """
-    ctx: click.Context = click.get_current_context()
-    root_path: Path = ctx.obj["root_path"]
-
-    if root_path is None:
-        print("Missing root_path in context. Unable to notify daemon")
-        return None
-
-    async with acquire_connection_to_daemon(root_path, quiet=True) as daemon:
-        if daemon is not None:
-            passphrase: str = Keychain.get_cached_master_passphrase()
-
-            print("Updating daemon... ", end="")
-            response: WsRpcMessage = await daemon.notify_keyring_migration_completed(passphrase)
-            success: bool = response.get("data", {}).get("success", False)
-            print("succeeded" if success is True else "failed")
