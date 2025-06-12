@@ -131,7 +131,7 @@ async def test_farmer_signage_point_endpoints(harvester_farmer_environment: Harv
         return len(await farmer_rpc_client.get_signage_points()) > 0
 
     sp = farmer_protocol.NewSignagePoint(
-        std_hash(b"1"), std_hash(b"2"), std_hash(b"3"), uint64(1), uint64(1000000), uint8(2), uint32(1)
+        std_hash(b"1"), std_hash(b"2"), std_hash(b"3"), uint64(1), uint64(1000000), uint8(2), uint32(1), uint32(0)
     )
     await farmer_api.new_signage_point(sp)
 
@@ -241,7 +241,7 @@ async def test_farmer_get_pool_state(
             pool_dict[key].insert(0, before_24h)
 
     sp = farmer_protocol.NewSignagePoint(
-        std_hash(b"1"), std_hash(b"2"), std_hash(b"3"), uint64(1), uint64(1000000), uint8(2), uint32(1)
+        std_hash(b"1"), std_hash(b"2"), std_hash(b"3"), uint64(1), uint64(1000000), uint8(2), uint32(1), uint32(0)
     )
     await farmer_api.new_signage_point(sp)
     client_pool_state = await farmer_rpc_client.get_pool_state()
@@ -397,7 +397,7 @@ async def test_farmer_get_harvester_plots_endpoints(
         plots = harvester_plots
     elif endpoint == FarmerRpcClient.get_harvester_plots_invalid:
         invalid_paths = add_plot_directories("invalid", 3)
-        for dir_index, r in [(0, range(0, 6)), (1, range(6, 8)), (2, range(8, 13))]:
+        for dir_index, r in [(0, range(6)), (1, range(6, 8)), (2, range(8, 13))]:
             plots += [str(invalid_paths[dir_index] / f"{i}.plot") for i in r]
         for plot in plots:
             with open(plot, "w"):
@@ -412,7 +412,7 @@ async def test_farmer_get_harvester_plots_endpoints(
 
     elif endpoint == FarmerRpcClient.get_harvester_plots_duplicates:
         duplicate_paths = add_plot_directories("duplicates", 2)
-        for dir_index, r in [(0, range(0, 3)), (1, range(3, 7))]:
+        for dir_index, r in [(0, range(3)), (1, range(3, 7))]:
             for i in r:
                 plot_path = Path(harvester_plots[i]["filename"])
                 plots.append(str(duplicate_paths[dir_index] / plot_path.name))

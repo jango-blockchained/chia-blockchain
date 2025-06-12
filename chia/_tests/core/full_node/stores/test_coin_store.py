@@ -12,6 +12,7 @@ from chia_rs.sized_ints import uint32, uint64
 from clvm.casts import int_to_bytes
 
 from chia._tests.blockchain.blockchain_test_utils import _validate_and_add_block
+from chia._tests.util.coin_store import add_coin_records_to_db
 from chia._tests.util.db_connection import DBConnection
 from chia._tests.util.get_name_puzzle_conditions import get_name_puzzle_conditions
 from chia._tests.util.misc import Marks, datacases
@@ -251,48 +252,41 @@ async def test_rollback(db_version: int, bt: BlockTools) -> None:
         all_coins: list[Coin] = []
 
         for block in blocks:
-            all_coins += list(block.get_included_reward_coins())
-            if block.is_transaction_block():
-                removals: list[bytes32] = []
-                additions: list[Coin] = []
-                assert block.foliage_transaction_block is not None
-                await coin_store.new_block(
-                    block.height,
-                    block.foliage_transaction_block.timestamp,
-                    block.get_included_reward_coins(),
-                    additions,
-                    removals,
-                )
-                coins = block.get_included_reward_coins()
-                records = [await coin_store.get_coin_record(coin.name()) for coin in coins]
+            if not block.is_transaction_block():
+                continue
+            assert block.foliage_transaction_block is not None
+            reward_coins = block.get_included_reward_coins()
+            all_coins += reward_coins
+            await coin_store.new_block(block.height, block.foliage_transaction_block.timestamp, reward_coins, [], [])
+            records = [await coin_store.get_coin_record(coin.name()) for coin in reward_coins]
 
-                spend_selected_coin = selected_coin is not None
-                if block.height != 0 and selected_coin is None:
-                    # Select the first CoinRecord which will be spent at the next transaction block.
-                    selected_coin = records[0]
-                    await coin_store._set_spent([r.name for r in records[1:] if r is not None], block.height)
+            spend_selected_coin = selected_coin is not None
+            if block.height != 0 and selected_coin is None:
+                # Select the first CoinRecord which will be spent at the next transaction block.
+                selected_coin = records[0]
+                await coin_store._set_spent([r.name for r in records[1:] if r is not None], block.height)
+            else:
+                await coin_store._set_spent([r.name for r in records if r is not None], block.height)
+
+            if spend_selected_coin:
+                assert selected_coin is not None
+                await coin_store._set_spent([selected_coin.name], block.height)
+
+            records = [await coin_store.get_coin_record(coin.name()) for coin in reward_coins]  # update coin records
+            for record in records:
+                assert record is not None
+                if (
+                    selected_coin is not None
+                    and selected_coin.name == record.name
+                    and not selected_coin.confirmed_block_index < block.height
+                ):
+                    assert not record.spent
                 else:
-                    await coin_store._set_spent([r.name for r in records if r is not None], block.height)
+                    assert record.spent
+                    assert record.spent_block_index == block.height
 
-                if spend_selected_coin:
-                    assert selected_coin is not None
-                    await coin_store._set_spent([selected_coin.name], block.height)
-
-                records = [await coin_store.get_coin_record(coin.name()) for coin in coins]  # update coin records
-                for record in records:
-                    assert record is not None
-                    if (
-                        selected_coin is not None
-                        and selected_coin.name == record.name
-                        and not selected_coin.confirmed_block_index < block.height
-                    ):
-                        assert not record.spent
-                    else:
-                        assert record.spent
-                        assert record.spent_block_index == block.height
-
-                if spend_selected_coin:
-                    break
+            if spend_selected_coin:
+                break
 
         assert selected_coin is not None
         reorg_index = selected_coin.confirmed_block_index
@@ -313,17 +307,18 @@ async def test_rollback(db_version: int, bt: BlockTools) -> None:
                 assert coin_record.coin in changed_coin_records
 
         for block in blocks:
-            if block.is_transaction_block():
-                coins = block.get_included_reward_coins()
-                records = [await coin_store.get_coin_record(coin.name()) for coin in coins]
+            if not block.is_transaction_block():
+                continue
+            reward_coins = block.get_included_reward_coins()
+            records = [await coin_store.get_coin_record(coin.name()) for coin in reward_coins]
 
-                if block.height <= reorg_index:
-                    for record in records:
-                        assert record is not None
-                        assert record.spent == (record.name != selected_coin.name)
-                else:
-                    for record in records:
-                        assert record is None
+            if block.height <= reorg_index:
+                for record in records:
+                    assert record is not None
+                    assert record.spent == (record.name != selected_coin.name)
+            else:
+                for record in records:
+                    assert record is None
 
 
 @pytest.mark.anyio
@@ -440,7 +435,7 @@ async def test_get_coin_states(db_version: int) -> None:
             for i in range(1, 301)
         ]
         coin_store = await CoinStore.create(db_wrapper)
-        await coin_store._add_coin_records(crs)
+        await add_coin_records_to_db(coin_store.db_wrapper, crs)
 
         assert len(await coin_store.get_coin_states_by_puzzle_hashes(True, {std_hash(b"2")}, uint32(0))) == 300
         assert len(await coin_store.get_coin_states_by_puzzle_hashes(False, {std_hash(b"2")}, uint32(0))) == 0
@@ -568,7 +563,7 @@ async def test_coin_state_batches(
         coin_store = await CoinStore.create(db_wrapper)
         hint_store = await HintStore.create(db_wrapper)
 
-        await coin_store._add_coin_records(random_coin_records.items)
+        await add_coin_records_to_db(coin_store.db_wrapper, random_coin_records.items)
         await hint_store.add_hints(random_coin_records.hints)
 
         # Make sure all of the coin states are found when batching.
@@ -662,7 +657,7 @@ async def test_batch_many_coin_states(db_version: int, cut_off_middle: bool) -> 
         coin_store = await CoinStore.create(db_wrapper)
         await HintStore.create(db_wrapper)
 
-        await coin_store._add_coin_records(coin_records)
+        await add_coin_records_to_db(coin_store.db_wrapper, coin_records)
 
         # Make sure all of the coin states are found.
         (all_coin_states, next_height) = await coin_store.batch_coin_states_by_puzzle_hashes([ph])
@@ -675,7 +670,8 @@ async def test_batch_many_coin_states(db_version: int, cut_off_middle: bool) -> 
             assert coin_records[i].coin.name().hex() == all_coin_states[i].coin.name().hex(), i
 
         # For the middle case, insert a coin record between the two heights 10 and 12.
-        await coin_store._add_coin_records(
+        await add_coin_records_to_db(
+            coin_store.db_wrapper,
             [
                 CoinRecord(
                     coin=Coin(std_hash(b"extra coin"), ph, uint64(0)),
@@ -686,7 +682,7 @@ async def test_batch_many_coin_states(db_version: int, cut_off_middle: bool) -> 
                     coinbase=False,
                     timestamp=uint64(0),
                 )
-            ]
+            ],
         )
 
         (all_coin_states, next_height) = await coin_store.batch_coin_states_by_puzzle_hashes([ph])
@@ -723,7 +719,7 @@ async def test_duplicate_by_hint(db_version: int) -> None:
             uint64(12321312),
         )
 
-        await coin_store._add_coin_records([cr])
+        await add_coin_records_to_db(coin_store.db_wrapper, [cr])
         await hint_store.add_hints([(cr.coin.name(), cr.coin.puzzle_hash)])
 
         coin_states, height = await coin_store.batch_coin_states_by_puzzle_hashes([cr.coin.puzzle_hash])
@@ -884,3 +880,25 @@ async def test_get_unspent_lineage_info_for_puzzle_hash(case: UnspentLineageInfo
             )
         else:
             assert result is None
+
+
+@pytest.mark.anyio
+async def test_add_coin_records_to_db() -> None:
+    async with DBConnection(2) as db_wrapper:
+        coin_store = await CoinStore.create(db_wrapper)
+        test_records = [
+            CoinRecord(
+                coin=Coin(bytes32([i * 2] * 32), bytes32([i * 2 + 1] * 32), uint64(i)),
+                confirmed_block_index=uint32(i + 1),
+                spent_block_index=uint32(i),
+                coinbase=i % 2 == 0,
+                timestamp=uint64(i),
+            )
+            for i in range(5)
+        ]
+        await add_coin_records_to_db(db_wrapper, test_records)
+        # Verify all records got inserted correctly
+        for record in test_records:
+            resulting_record = await coin_store.get_coin_record(record.coin.name())
+            assert resulting_record is not None
+            assert resulting_record == record
